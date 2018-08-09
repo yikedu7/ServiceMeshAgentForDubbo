@@ -1,0 +1,225 @@
+package controller
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+
+	"code.aliyun.com/runningguys/agent/dubbo"
+	"code.aliyun.com/runningguys/agent/registry"
+	"github.com/coreos/etcd/clientv3"
+)
+
+var interfaceName = "com.alibaba.dubbo.performance.demo.provider.IHelloService"
+
+var rid uint64
+
+type consumerAgent struct {
+	port      string
+	reg       *registry.EtcdRegistry
+	endpoints []registry.EndPoint
+	length    int
+}
+
+func startConsumerAgent(property registry.Property, cli *clientv3.Client) {
+	reg := new(registry.EtcdRegistry)
+	reg.Init(cli, property)
+	ca := &consumerAgent{property.Port, reg, nil, 0}
+	ca.endpoints = ca.reg.Find(interfaceName)
+	ca.length = len(ca.endpoints)
+	ca.listenAndServe()
+}
+func (ca *consumerAgent) readRequest(conn net.Conn, pcon net.Conn, br *bufio.Reader) *http.Request {
+
+	req, err := http.ReadRequest(br)
+
+	if err != nil {
+		if err == io.EOF {
+		} else {
+			fmt.Println(err)
+		}
+		req = new(http.Request)
+		req.Close = true
+		return req
+	}
+	if req.Method == "POST" {
+		method := req.PostFormValue("method")
+		paramTypes := req.PostFormValue("parameterTypesString")
+		params := req.PostFormValue("parameter")
+		//requestID := atomic.AddUint64(&rid, 1)
+		dub := dubbo.NewDubbo("2.6.1")
+		buf := dub.Encode(0, interfaceName, "", method, paramTypes, []string{params})
+
+		if err != nil {
+			panic(err)
+		}
+		_, err = pcon.Write(buf)
+		if err != nil {
+			req.Close = true
+			return req
+		}
+		err = ca.readResponse(pcon, conn)
+		//_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\ncontent-type:application/json;charset=UTF-8\r\n" + "content-length:" + "1" + "\r\n\r\n" + "1"))
+		if err != nil {
+			//fmt.Println(err)
+			req.Close = true
+		}
+	} else {
+		fmt.Println("undefined method")
+		req.Close = true
+	}
+
+	return req
+
+}
+func (ca *consumerAgent) serve(conn net.Conn) {
+	br := bufio.NewReader(conn)
+	defer conn.Close()
+
+	index := ca.roundRobin()
+	ep := ca.endpoints[index]
+	pcon, err := net.Dial("tcp", ep.Host+":"+ep.Port)
+	if err != nil {
+		panic(err)
+	}
+	defer pcon.Close()
+
+	for {
+		req := ca.readRequest(conn, pcon, br)
+
+		if req.Close {
+			break
+		}
+	}
+}
+
+func (ca *consumerAgent) roundRobin() int {
+	id := atomic.AddUint64(&rid, 1)
+	return int(id % uint64(ca.length))
+}
+
+func (ca *consumerAgent) readResponse(pcon net.Conn, conn net.Conn) error {
+	header := make([]byte, 16)
+	err := readn(pcon, header, 16)
+	if err != nil {
+		fmt.Println("readResponse error")
+		return err
+	}
+	dataLen := binary.BigEndian.Uint32(header[12:16])
+	data := make([]byte, dataLen)
+	readn(pcon, data, dataLen)
+	resb := bytes.Split(data, []byte("\n"))[1]
+	l := len(resb)
+	res := string(resb[:])
+	ls := strconv.Itoa(l)
+
+	_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\ncontent-type:application/json;charset=UTF-8\r\n" + "content-length:" + ls + "\r\n\r\n" + res))
+
+	if err != nil {
+		fmt.Println("conn write error")
+		return err
+	}
+	return nil
+}
+
+func (ca *consumerAgent) listenAndServe() {
+	ln, err := net.Listen("tcp", ":"+ca.port)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(err)
+		}
+		go ca.serve(conn)
+	}
+}
+
+type providerAgent struct {
+	port     string
+	destPort string
+}
+
+func startProviderAgent(property registry.Property, cli *clientv3.Client) {
+	reg := new(registry.EtcdRegistry)
+	reg.Init(cli, property)
+	pa := &providerAgent{property.Port, property.DestPort}
+	pa.listenAndServe()
+}
+
+func (pa *providerAgent) listenAndServe() {
+	ln, err := net.Listen("tcp", ":"+pa.port)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(err)
+		}
+		go pa.serve(conn)
+	}
+}
+
+func (pa *providerAgent) serve(conn net.Conn) {
+	defer conn.Close()
+
+	pcon, err := net.Dial("tcp", "127.0.0.1:"+pa.destPort)
+	if err != nil {
+		panic(err)
+	}
+	go copy(conn, pcon)
+
+	_, err = io.Copy(pcon, conn)
+	if err != nil {
+		fmt.Println(err)
+	}
+
+}
+func copy(conn net.Conn, pcon net.Conn) {
+	defer pcon.Close()
+
+	_, err := io.Copy(conn, pcon)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+// StartAgent ...
+func StartAgent(property registry.Property, cli *clientv3.Client) {
+	if property.ServiceType == "provider" {
+		startProviderAgent(property, cli)
+	} else if property.ServiceType == "consumer" {
+		startConsumerAgent(property, cli)
+	} else {
+		fmt.Println("invalid service type")
+	}
+}
+
+func readn(conn net.Conn, buf []byte, l uint32) error {
+	len := uint32(0)
+	for {
+		n, err := conn.Read(buf[len:])
+		if n > 0 {
+			len += uint32(n)
+			if l >= len {
+				break
+			}
+		}
+		if err != nil {
+
+			fmt.Printf("读错误\n")
+			return err
+
+		}
+	}
+	return nil
+}

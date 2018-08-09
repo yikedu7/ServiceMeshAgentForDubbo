@@ -1,0 +1,518 @@
+package controller
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"code.aliyun.com/runningguys/agent/dubbo"
+	"code.aliyun.com/runningguys/agent/registry"
+	"github.com/coreos/etcd/clientv3"
+)
+
+type consumerAgent struct {
+	port      string
+	reg       *registry.EtcdRegistry
+	endpoints []registry.EndPoint
+	pcons     []myconn
+	resp      map[uint64]chan []byte
+	sum       int
+	length    int
+}
+
+func startConsumerAgent(property registry.Property, cli *clientv3.Client) {
+	reg := new(registry.EtcdRegistry)
+	reg.Init(cli, property)
+	ca := &consumerAgent{property.Port, reg, nil, nil, nil, 0, 0}
+	ca.endpoints = ca.reg.Find(interfaceName)
+	ca.length = len(ca.endpoints)
+	for i := 0; i < ca.length; i++ {
+		ca.sum += ca.endpoints[i].Power
+	}
+	ca.pcons = make([]myconn, ca.length)
+	ca.resp = make(map[uint64]chan []byte)
+	defer ca.closePcon()
+	ca.listenAndServe()
+}
+
+func (ca *consumerAgent) Connect() {
+	for i := 0; i < len(ca.endpoints); i++ {
+		ep := ca.endpoints[i]
+		pcon, err := net.Dial("tcp", ep.Host+":"+ep.Port)
+		if err != nil {
+			panic(err)
+		}
+
+		mcon := myconn{pcon, make(chan struct{}, 1), ep.Power, make(chan []byte, maxQueue), 0}
+		ca.pcons[i] = mcon
+		go ca.readPcon(&ca.pcons[i])
+		go ca.writePcon(&ca.pcons[i], ca.sum/ep.Power)
+		fmt.Println("create conn")
+	}
+}
+
+func (ca *consumerAgent) readwritePcon() {
+	once.Do(ca.Connect)
+}
+
+func (ca *consumerAgent) writePcon(mcon *myconn, delay int) {
+	pcon := mcon.con
+	for {
+		/*
+			select {
+			case <-mcon.full:
+				time.Sleep(time.Microsecond)
+			default:
+			}
+		*/
+		buf := <-mcon.pchan
+
+		_, err := pcon.Write(buf)
+		if err != nil {
+			fmt.Println("write pcon error")
+			break
+		}
+		//time.Sleep(time.Nanosecond * time.Duration(delay))
+	}
+}
+func (ca *consumerAgent) readPcon(mcon *myconn) {
+	pcon := mcon.con
+	for {
+		header := make([]byte, 16)
+		err := readn(pcon, header, 16)
+		if err != nil {
+			fmt.Println("readResponse error")
+			break
+			//return err
+		}
+		dataLen := binary.BigEndian.Uint32(header[12:16])
+		id := binary.BigEndian.Uint64(header[4:12])
+		data := make([]byte, dataLen)
+		err = readn(pcon, data, dataLen)
+		if err != nil {
+			fmt.Println("readResponse error")
+			//return err
+			break
+		}
+		resbs := bytes.Split(data, []byte("\n"))
+		resbType := string(resbs[0][:])
+		resb := resbs[1]
+		mu.Lock()
+		ch, ok := ca.resp[id]
+		if ok {
+			ch <- resb
+			if resbType != "1" {
+				fmt.Println("Power", mcon.power, time.Now().String()+":full")
+				/*select {
+				case mcon.full <- struct{}{}:
+				default:
+				}*/
+			} else {
+				atomic.AddInt32(&mcon.active, -1)
+			}
+
+			delete(ca.resp, id)
+		} else {
+			fmt.Println("id 不存在")
+		}
+		mu.Unlock()
+	}
+}
+
+func (ca *consumerAgent) closePcon() {
+	for _, con := range ca.pcons {
+		con.con.Close()
+	}
+}
+func (ca *consumerAgent) readRequest(conn net.Conn, br *bufio.Reader) *http.Request {
+
+	req, err := http.ReadRequest(br)
+
+	if err != nil {
+		if err == io.EOF {
+		} else {
+			fmt.Println(err)
+		}
+		req = new(http.Request)
+		req.Close = true
+		return req
+	}
+	if req.Method == "POST" {
+		method := req.PostFormValue("method")
+		paramTypes := req.PostFormValue("parameterTypesString")
+		params := req.PostFormValue("parameter")
+		requestID := atomic.AddUint64(&rid, 1)
+		dub := dubbo.NewDubbo("2.6.1")
+		buf := dub.Encode(requestID, interfaceName, "", method, paramTypes, []string{params})
+		ch := make(chan []byte)
+		mu.Lock()
+		ca.resp[requestID] = ch
+		mu.Unlock()
+		index := ca.leastActive()
+		ca.pcons[index].pchan <- buf
+		atomic.AddInt32(&ca.pcons[index].active, 1)
+		resb := <-ch
+		ls := strconv.Itoa(len(resb))
+		res := string(resb[:])
+		//err = ca.readResponse(pcon, conn)
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\ncontent-type:application/json;charset=UTF-8\r\n" + "content-length:" + ls + "\r\n\r\n" + res))
+		if err != nil {
+			//fmt.Println(err)
+			req.Close = true
+		}
+	} else {
+		fmt.Println("undefined method")
+		req.Close = true
+	}
+
+	return req
+
+}
+func (ca *consumerAgent) serve(conn net.Conn) {
+	br := bufio.NewReader(conn)
+	defer conn.Close()
+
+	for {
+		req := ca.readRequest(conn, br)
+
+		if req.Close {
+			break
+		}
+	}
+}
+
+/*func (ca *consumerAgent) sel() int {
+	r := rand.Intn(ca.sum)
+	n := len(ca.endpoints)
+	down := 0
+	up := 0
+	for i := 0; i < n; i++ {
+		up += ca.endpoints[i].Power
+		if down <= r && r < up {
+			return i
+		}
+		down = up
+	}
+	return n - 1
+}*/
+
+/*func (ca *consumerAgent) selFromID(id uint64) int {
+	r := int(id % uint64(ca.sum))
+	n := len(ca.endpoints)
+	down := 0
+	up := 0
+	for i := 0; i < n; i++ {
+		up += ca.endpoints[i].Power
+		if down <= r && r < up {
+			return i
+		}
+		down = up
+	}
+	return n - 1
+}
+*/
+
+func (ca *consumerAgent) leastActive() int {
+	index := 0
+	min := ca.pcons[0].active
+	for i := 1; i < ca.length; i++ {
+		active := ca.pcons[i].active
+		if active < min {
+			min = active
+			index = i
+		}
+	}
+	return index
+}
+
+/*func (ca *consumerAgent) writeDatas(buf []byte) {
+	for {
+		index := ca.sel()
+		select {
+		case ca.pcons[index].pchan <- buf:
+			return
+		default:
+		}
+	}
+}*/
+
+func (ca *consumerAgent) listenAndServe() {
+	ln, err := net.Listen("tcp", ":"+ca.port)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(err)
+		}
+		ca.readwritePcon()
+		go ca.serve(conn)
+	}
+}
+package controller
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strconv"
+	"sync/atomic"
+	"time"
+
+	"code.aliyun.com/runningguys/agent/dubbo"
+	"code.aliyun.com/runningguys/agent/registry"
+	"github.com/coreos/etcd/clientv3"
+)
+
+type consumerAgent struct {
+	port      string
+	reg       *registry.EtcdRegistry
+	endpoints []registry.EndPoint
+	pcons     []myconn
+	resp      map[uint64]chan []byte
+	sum       int
+	length    int
+}
+
+func startConsumerAgent(property registry.Property, cli *clientv3.Client) {
+	reg := new(registry.EtcdRegistry)
+	reg.Init(cli, property)
+	ca := &consumerAgent{property.Port, reg, nil, nil, nil, 0, 0}
+	ca.endpoints = ca.reg.Find(interfaceName)
+	ca.length = len(ca.endpoints)
+	for i := 0; i < ca.length; i++ {
+		ca.sum += ca.endpoints[i].Power
+	}
+	ca.pcons = make([]myconn, ca.length)
+	ca.resp = make(map[uint64]chan []byte)
+	defer ca.closePcon()
+	ca.listenAndServe()
+}
+
+func (ca *consumerAgent) Connect() {
+	for i := 0; i < len(ca.endpoints); i++ {
+		ep := ca.endpoints[i]
+		pcon, err := net.Dial("tcp", ep.Host+":"+ep.Port)
+		if err != nil {
+			panic(err)
+		}
+
+		mcon := myconn{pcon, make(chan struct{}, 1), ep.Power, make(chan []byte, maxQueue), 0}
+		ca.pcons[i] = mcon
+		go ca.readPcon(&ca.pcons[i])
+		go ca.writePcon(&ca.pcons[i], ca.sum/ep.Power)
+		fmt.Println("create conn")
+	}
+}
+
+func (ca *consumerAgent) readwritePcon() {
+	once.Do(ca.Connect)
+}
+
+func (ca *consumerAgent) writePcon(mcon *myconn, delay int) {
+	pcon := mcon.con
+	for {
+		/*
+			select {
+			case <-mcon.full:
+				time.Sleep(time.Microsecond)
+			default:
+			}
+		*/
+		buf := <-mcon.pchan
+
+		_, err := pcon.Write(buf)
+		if err != nil {
+			fmt.Println("write pcon error")
+			break
+		}
+		//time.Sleep(time.Nanosecond * time.Duration(delay))
+	}
+}
+func (ca *consumerAgent) readPcon(mcon *myconn) {
+	pcon := mcon.con
+	for {
+		header := make([]byte, 16)
+		err := readn(pcon, header, 16)
+		if err != nil {
+			fmt.Println("readResponse error")
+			break
+			//return err
+		}
+		dataLen := binary.BigEndian.Uint32(header[12:16])
+		id := binary.BigEndian.Uint64(header[4:12])
+		data := make([]byte, dataLen)
+		err = readn(pcon, data, dataLen)
+		if err != nil {
+			fmt.Println("readResponse error")
+			//return err
+			break
+		}
+		resbs := bytes.Split(data, []byte("\n"))
+		resbType := string(resbs[0][:])
+		resb := resbs[1]
+		mu.Lock()
+		ch, ok := ca.resp[id]
+		if ok {
+			ch <- resb
+			if resbType != "1" {
+				fmt.Println("Power", mcon.power, time.Now().String()+":full")
+				/*select {
+				case mcon.full <- struct{}{}:
+				default:
+				}*/
+			} else {
+				atomic.AddInt32(&mcon.active, -1)
+			}
+
+			delete(ca.resp, id)
+		} else {
+			fmt.Println("id 不存在")
+		}
+		mu.Unlock()
+	}
+}
+
+func (ca *consumerAgent) closePcon() {
+	for _, con := range ca.pcons {
+		con.con.Close()
+	}
+}
+func (ca *consumerAgent) readRequest(conn net.Conn, br *bufio.Reader) *http.Request {
+
+	req, err := http.ReadRequest(br)
+
+	if err != nil {
+		if err == io.EOF {
+		} else {
+			fmt.Println(err)
+		}
+		req = new(http.Request)
+		req.Close = true
+		return req
+	}
+	if req.Method == "POST" {
+		method := req.PostFormValue("method")
+		paramTypes := req.PostFormValue("parameterTypesString")
+		params := req.PostFormValue("parameter")
+		requestID := atomic.AddUint64(&rid, 1)
+		dub := dubbo.NewDubbo("2.6.1")
+		buf := dub.Encode(requestID, interfaceName, "", method, paramTypes, []string{params})
+		ch := make(chan []byte)
+		mu.Lock()
+		ca.resp[requestID] = ch
+		mu.Unlock()
+		index := ca.leastActive()
+		ca.pcons[index].pchan <- buf
+		atomic.AddInt32(&ca.pcons[index].active, 1)
+		resb := <-ch
+		ls := strconv.Itoa(len(resb))
+		res := string(resb[:])
+		//err = ca.readResponse(pcon, conn)
+		_, err = conn.Write([]byte("HTTP/1.1 200 OK\r\ncontent-type:application/json;charset=UTF-8\r\n" + "content-length:" + ls + "\r\n\r\n" + res))
+		if err != nil {
+			//fmt.Println(err)
+			req.Close = true
+		}
+	} else {
+		fmt.Println("undefined method")
+		req.Close = true
+	}
+
+	return req
+
+}
+func (ca *consumerAgent) serve(conn net.Conn) {
+	br := bufio.NewReader(conn)
+	defer conn.Close()
+
+	for {
+		req := ca.readRequest(conn, br)
+
+		if req.Close {
+			break
+		}
+	}
+}
+
+/*func (ca *consumerAgent) sel() int {
+	r := rand.Intn(ca.sum)
+	n := len(ca.endpoints)
+	down := 0
+	up := 0
+	for i := 0; i < n; i++ {
+		up += ca.endpoints[i].Power
+		if down <= r && r < up {
+			return i
+		}
+		down = up
+	}
+	return n - 1
+}*/
+
+/*func (ca *consumerAgent) selFromID(id uint64) int {
+	r := int(id % uint64(ca.sum))
+	n := len(ca.endpoints)
+	down := 0
+	up := 0
+	for i := 0; i < n; i++ {
+		up += ca.endpoints[i].Power
+		if down <= r && r < up {
+			return i
+		}
+		down = up
+	}
+	return n - 1
+}
+*/
+
+func (ca *consumerAgent) leastActive() int {
+	index := 0
+	min := ca.pcons[0].active
+	for i := 1; i < ca.length; i++ {
+		active := ca.pcons[i].active
+		if active < min {
+			min = active
+			index = i
+		}
+	}
+	return index
+}
+
+/*func (ca *consumerAgent) writeDatas(buf []byte) {
+	for {
+		index := ca.sel()
+		select {
+		case ca.pcons[index].pchan <- buf:
+			return
+		default:
+		}
+	}
+}*/
+
+func (ca *consumerAgent) listenAndServe() {
+	ln, err := net.Listen("tcp", ":"+ca.port)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(err)
+		}
+		ca.readwritePcon()
+		go ca.serve(conn)
+	}
+}

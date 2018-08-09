@@ -1,0 +1,161 @@
+package controller
+
+import (
+	"bytes"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"time"
+
+	"code.aliyun.com/runningguys/agent/registry"
+	"github.com/coreos/etcd/clientv3"
+)
+
+const (
+	headerLength        = 16
+	magicHigh           = byte(0xda)
+	magicLow            = byte(0xbb)
+	flagRequest         = byte(0x80)
+	flagTwoWay          = byte(0x40)
+	defualtDubboVersion = "2.0.1"
+)
+
+type chanCon struct {
+	con net.Conn
+	ch  chan []byte
+}
+
+type providerAgent struct {
+	port       string
+	destPort   string
+	threadpool chan int
+}
+
+func startProviderAgent(property registry.Property, cli *clientv3.Client) {
+	reg := new(registry.EtcdRegistry)
+	reg.Init(cli, property)
+
+	pa := &providerAgent{property.Port, property.DestPort, nil}
+	pa.threadpool = make(chan int, 200)
+	for i := 0; i < 200; i++ {
+		pa.threadpool <- i + 1
+	}
+	pa.listenAndServe()
+}
+
+func (pa *providerAgent) listenAndServe() {
+	ln, err := net.Listen("tcp", ":"+pa.port)
+	if err != nil {
+		panic(err)
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			panic(err)
+		}
+		go pa.serve(conn)
+	}
+}
+
+func (pa *providerAgent) serve(conn net.Conn) {
+	defer conn.Close()
+	cc := chanCon{conn, make(chan []byte, 200)}
+	/*
+		pcon, err := net.Dial("tcp", "127.0.0.1:"+pa.destPort)
+		if err != nil {
+			panic(err)
+		}
+	*/
+	go pa.response(cc)
+	for {
+		header := make([]byte, 16)
+		err := readn(conn, header, 16)
+		if err != nil {
+			fmt.Println("readResponse error")
+			break
+			//return err
+		}
+		dataLen := binary.BigEndian.Uint32(header[12:16])
+		id := binary.BigEndian.Uint64(header[4:12])
+		data := make([]byte, dataLen)
+		err = readn(conn, data, dataLen)
+		if err != nil {
+			fmt.Println("provider agent readn error")
+		}
+		select {
+		case pid := <-pa.threadpool:
+			go pa.helloServe(cc, pid, id, []byte("1\n0\n"))
+		default:
+			buf := pa.makeDubbo(id, []byte("2\nerror\n"))
+			fmt.Println("threadpool exhausted!")
+			cc.ch <- buf
+		}
+
+	}
+
+}
+func (pa *providerAgent) response(cc chanCon) {
+	for {
+		buf := <-cc.ch
+		_, err := cc.con.Write(buf)
+		if err != nil {
+			fmt.Println("provider response error")
+			break
+		}
+	}
+}
+
+func (pa *providerAgent) helloServe(cc chanCon, pid int, id uint64, data []byte) {
+	buf := pa.makeDubbo(id, data)
+	fmt.Println(time.Now(), "thread", pid)
+	time.Sleep(time.Millisecond * 50)
+	cc.ch <- buf
+	pa.threadpool <- pid
+
+}
+func copy(conn net.Conn, pcon net.Conn) {
+	defer pcon.Close()
+
+	_, err := io.Copy(conn, pcon)
+
+	if err != nil {
+		fmt.Println(err)
+	}
+}
+
+func (pa *providerAgent) makeDubbo(id uint64, data []byte) []byte {
+	serializationID := byte(0x6)
+	// header.
+	header := make([]byte, headerLength)
+
+	// set magic number
+	header[0] = magicHigh
+	header[1] = magicLow
+	// set request and serilization bit
+	header[2] = byte(flagRequest | flagTwoWay | serializationID)
+	// set request id
+	binary.BigEndian.PutUint64(header[4:12], id)
+	dataLen := uint32(len(data))
+	// encode request data.
+	binary.BigEndian.PutUint32(header[12:16], dataLen)
+
+	buf := bytes.NewBuffer(header)
+
+	_, err := buf.Write(data)
+	if err != nil {
+		panic(err)
+	}
+	return buf.Bytes()
+}
+
+// StartAgent ...
+func StartAgent(property registry.Property, cli *clientv3.Client) {
+	if property.ServiceType == "provider" {
+		startProviderAgent(property, cli)
+	} else if property.ServiceType == "consumer" {
+		startConsumerAgent(property, cli)
+	} else {
+		fmt.Println("invalid service type")
+	}
+}
